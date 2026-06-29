@@ -410,7 +410,14 @@ def main():
         "reap": cmd_reap,
         "resource": cmd_resource,
     }
-    return handlers[args.cmd](config, provider, sd, args)
+    try:
+        return handlers[args.cmd](config, provider, sd, args)
+    except subprocess.CalledProcessError as error:
+        print(f"corral: command failed (exit {error.returncode}): {' '.join(error.cmd)}", file=sys.stderr)
+        return 1
+    except RuntimeError as error:
+        print(f"corral: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
