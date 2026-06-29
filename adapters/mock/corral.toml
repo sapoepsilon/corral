@@ -1,0 +1,18 @@
+# Reference adapter: runs the full lifecycle with no infrastructure.
+# Try it:  corral -c adapters/mock/corral.toml allocate demo
+[corral]
+state_dir = "~/.corral-mock"
+
+[provider]
+type = "mock"
+name_prefix = "mock-"
+id_min = 900
+id_max = 905
+
+[pool]
+cap = 3
+baseline_id = 100
+baseline_ip = "10.0.0.100"
+
+[hooks]
+dir = "adapters/mock/hooks"

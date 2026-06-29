@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""corral — broker ephemeral backend boxes on a Proxmox-style host and serialize
+scarce resources (e.g. a physical device) behind a lock.
+
+The engine is generic: it knows how to clone/destroy/list boxes and how to run a
+queue, and nothing else. Everything project-specific (how to install the backend,
+build a frontend, reach a device) lives in hook scripts the project supplies.
+
+Requires Python 3.11+ (stdlib tomllib). No third-party dependencies.
+"""
+import argparse
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+EX_TEMPFAIL = 75  # "try again later" — emitted when the pool is at cap
+
+
+def load_config(path):
+    with open(path, "rb") as handle:
+        return tomllib.load(handle)
+
+
+def state_dir(config):
+    raw = config.get("corral", {}).get("state_dir", "~/.corral")
+    directory = Path(os.path.expanduser(raw))
+    (directory / "clones").mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+class FileLock:
+    """Blocking exclusive flock. Blocking is intentional: a caller that loses the
+    race waits its turn rather than failing — the agent is happy to wait."""
+
+    def __init__(self, path):
+        self.path = str(path)
+        self.handle = None
+
+    def __enter__(self):
+        self.handle = open(self.path, "w")
+        fcntl.flock(self.handle, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *_):
+        fcntl.flock(self.handle, fcntl.LOCK_UN)
+        self.handle.close()
+
+
+class MockProvider:
+    """In-memory-ish provider backed by a JSON file. Lets the whole allocate /
+    cap / queue / release lifecycle be exercised with zero infrastructure."""
+
+    def __init__(self, config, sd):
+        self.store = sd / "mock-boxes.json"
+
+    def _read(self):
+        if self.store.exists():
+            return json.loads(self.store.read_text())
+        return {}
+
+    def _write(self, data):
+        self.store.write_text(json.dumps(data))
+
+    def list(self):
+        return [{"id": int(box_id), "name": name} for box_id, name in self._read().items()]
+
+    def clone(self, new_id, name):
+        data = self._read()
+        data[str(new_id)] = name
+        self._write(data)
+
+    def destroy(self, box_id):
+        data = self._read()
+        data.pop(str(box_id), None)
+        self._write(data)
+
+
+class ProxmoxProvider:
+    """Drives a Proxmox node over SSH. `kind = lxc` uses pct, `kind = qemu` uses
+    qm — the only difference the engine cares about is the command verb and the
+    name flag (pct: --hostname, qm: --name)."""
+
+    def __init__(self, config, sd):
+        provider = config["provider"]
+        self.ssh = provider["ssh"]
+        self.template = provider["template_id"]
+        self.kind = provider.get("kind", "lxc")
+        self.verb = "pct" if self.kind == "lxc" else "qm"
+        self.name_flag = "--hostname" if self.kind == "lxc" else "--name"
+
+    def _ssh(self, *command):
+        result = subprocess.run(
+            ["ssh", self.ssh, *command], check=True, capture_output=True, text=True
+        )
+        return result.stdout
+
+    def list(self):
+        output = self._ssh(self.verb, "list")
+        boxes = []
+        for line in output.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 2 or not parts[0].isdigit():
+                continue
+            # pct list:  VMID Status Lock Name   -> name is last column
+            # qm list:   VMID NAME STATUS ...     -> name is second column
+            name = parts[-1] if self.kind == "lxc" else parts[1]
+            boxes.append({"id": int(parts[0]), "name": name})
+        return boxes
+
+    def clone(self, new_id, name):
+        self._ssh(self.verb, "clone", str(self.template), str(new_id), self.name_flag, name, "--full", "0")
+        self._ssh(self.verb, "start", str(new_id))
+
+    def destroy(self, box_id):
+        # stop may fail if already stopped — that's fine, destroy is the goal.
+        subprocess.run(["ssh", self.ssh, self.verb, "stop", str(box_id)], capture_output=True, text=True)
+        self._ssh(self.verb, "destroy", str(box_id))
+
+
+def make_provider(config, sd):
+    kind = config["provider"]["type"]
+    if kind == "mock":
+        return MockProvider(config, sd)
+    if kind == "proxmox":
+        return ProxmoxProvider(config, sd)
+    raise SystemExit(f"unknown provider.type: {kind}")
+
+
+def run_hook(config, name, blob, timeout=900):
+    """Run a project hook, passing the connection blob as argv[1] and $CORRAL_BLOB.
+    A hook's last stdout line, if JSON, is merged into the blob. Missing hooks are
+    a no-op (hooks are optional)."""
+    hooks_dir = Path(config.get("hooks", {}).get("dir", "hooks"))
+    path = hooks_dir / name
+    if not path.exists():
+        return {}
+    payload = json.dumps(blob)
+    env = {**os.environ, "CORRAL_BLOB": payload}
+    result = subprocess.run([str(path), payload], env=env, capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError(f"hook {name} failed ({result.returncode}): {result.stderr.strip()}")
+    out = result.stdout.strip()
+    if not out:
+        return {}
+    try:
+        return json.loads(out.splitlines()[-1])
+    except json.JSONDecodeError:
+        return {}
+
+
+def free_id(config, provider):
+    bounds = config["provider"]
+    low, high = bounds.get("id_min", 900), bounds.get("id_max", 999)
+    used = {box["id"] for box in provider.list()}
+    for candidate in range(low, high + 1):
+        if candidate not in used:
+            return candidate
+    raise RuntimeError(f"no free clone id in range {low}-{high}")
+
+
+def base_blob(config, **extra):
+    provider = config["provider"]
+    blob = {"proxmox_ssh": provider.get("ssh"), "box_kind": provider.get("kind", "lxc")}
+    blob.update(extra)
+    return blob
+
+
+def cmd_allocate(config, provider, sd, args):
+    prefix = config["provider"].get("name_prefix", "corral-")
+    name = prefix + args.key
+    with FileLock(sd / "allocate.lock"):
+        if args.kind == "shared":
+            pool = config.get("pool", {})
+            blob = base_blob(config, kind="shared", key=args.key,
+                             box_id=pool.get("baseline_id"), ip=pool.get("baseline_ip"))
+            blob.update(run_hook(config, "setup-backend", blob))
+            print(json.dumps(blob))
+            return 0
+
+        clones = [box for box in provider.list() if box["name"].startswith(prefix)]
+        existing = next((box for box in clones if box["name"] == name), None)
+        if existing:
+            # idempotent: re-allocating the same key returns the live box.
+            blob = base_blob(config, kind="clone", key=args.key, box_id=existing["id"], name=name)
+            print(json.dumps(blob))
+            return 0
+
+        cap = config.get("pool", {}).get("cap", 5)
+        if len(clones) >= cap:
+            print(json.dumps({"status": "wait", "reason": f"cap {cap} reached", "live": len(clones)}))
+            return EX_TEMPFAIL
+
+        new_id = free_id(config, provider)
+        provider.clone(new_id, name)
+        created = int(time.time())
+        (sd / "clones" / f"{name}.json").write_text(json.dumps({"created": created, "key": args.key, "id": new_id}))
+        blob = base_blob(config, kind="clone", key=args.key, box_id=new_id, name=name, created=created)
+        blob.update(run_hook(config, "setup-backend", blob))
+        print(json.dumps(blob))
+        return 0
+
+
+def cmd_release(config, provider, sd, args):
+    prefix = config["provider"].get("name_prefix", "corral-")
+    name = prefix + args.key
+    box = next((box for box in provider.list() if box["name"] == name), None)
+    sidecar = sd / "clones" / f"{name}.json"
+    if not box:
+        sidecar.unlink(missing_ok=True)
+        print(json.dumps({"status": "absent", "key": args.key}))
+        return 0
+    blob = base_blob(config, key=args.key, box_id=box["id"], name=name)
+    run_hook(config, "teardown-extra", blob)
+    provider.destroy(box["id"])
+    sidecar.unlink(missing_ok=True)
+    print(json.dumps({"status": "released", "key": args.key, "box_id": box["id"]}))
+    return 0
+
+
+def cmd_list(config, provider, sd, args):
+    prefix = config["provider"].get("name_prefix", "corral-")
+    pool = config.get("pool", {})
+    clones = [box for box in provider.list() if box["name"].startswith(prefix)]
+    print(json.dumps({
+        "cap": pool.get("cap", 5),
+        "baseline_id": pool.get("baseline_id"),
+        "live": len(clones),
+        "clones": clones,
+    }, indent=2))
+    return 0
+
+
+def cmd_reap(config, provider, sd, args):
+    """Destroy clones older than --ttl minutes. Insurance against runs that
+    crashed before calling release. A live clone with no sidecar has unknown age
+    and is treated as stale."""
+    prefix = config["provider"].get("name_prefix", "corral-")
+    horizon = time.time() - args.ttl * 60
+    clones_dir = sd / "clones"
+    live = {box["name"]: box for box in provider.list() if box["name"].startswith(prefix)}
+    reaped = []
+    for name, box in live.items():
+        sidecar = clones_dir / f"{name}.json"
+        created = json.loads(sidecar.read_text()).get("created", 0) if sidecar.exists() else 0
+        if created > horizon:
+            continue
+        blob = base_blob(config, key=name[len(prefix):], box_id=box["id"], name=name)
+        run_hook(config, "teardown-extra", blob)
+        provider.destroy(box["id"])
+        sidecar.unlink(missing_ok=True)
+        reaped.append(name)
+    # drop sidecars whose box no longer exists
+    for sidecar in clones_dir.glob("*.json"):
+        if sidecar.stem not in live:
+            sidecar.unlink(missing_ok=True)
+    print(json.dumps({"reaped": reaped}))
+    return 0
+
+
+def cmd_resource(config, provider, sd, args):
+    command = args.cmd
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        print("usage: corral resource <name> -- <command...>", file=sys.stderr)
+        return 2
+    with FileLock(sd / f"res-{args.name}.lock"):
+        return subprocess.run(command).returncode
+
+
+SCAFFOLD_CONFIG = """\
+# corral project config. See HOOKS.md for the hook contract.
+[corral]
+state_dir = "~/.corral"
+
+[provider]
+type = "proxmox"        # proxmox | mock
+ssh = "my-proxmox"      # ssh host/alias of the Proxmox node
+kind = "lxc"            # lxc (pct) | qemu (qm)
+template_id = 100       # box to linked-clone from
+name_prefix = "corral-" # clones are named <name_prefix><key>
+id_min = 900
+id_max = 920
+
+[pool]
+cap = 5                 # max concurrent clones; allocate returns {"status":"wait"} past this
+baseline_id = 100       # always-on box returned by `allocate --kind shared`
+baseline_ip = ""        # how shared consumers reach the baseline
+
+[hooks]
+dir = "hooks"
+"""
+
+SCAFFOLD_HOOKS = {
+    "setup-backend": """\
+#!/usr/bin/env bash
+# Bring the freshly-cloned box online and install/start your backend.
+# Input: connection blob as $1 and $CORRAL_BLOB (json: box_id, name, proxmox_ssh, box_kind...).
+# Output: print a JSON object on the LAST stdout line — it is merged into the blob.
+#         At minimum echo the reachable backend URL.
+set -euo pipefail
+blob="${1:-$CORRAL_BLOB}"
+# box_id=$(jq -r .box_id <<<"$blob"); ssh "$(jq -r .proxmox_ssh <<<"$blob")" pct exec "$box_id" -- ...
+echo '{"backend_url":"http://CHANGE_ME","ip":"CHANGE_ME"}'
+""",
+    "build-frontend": """\
+#!/usr/bin/env bash
+# Build the frontend for a target against the backend in the blob.
+# Args: $1 = target (web|ios-sim|ios-device|macos|android-emu|android-device), $2 = blob json.
+set -euo pipefail
+target="$1"; blob="$2"
+echo "build $target -> CHANGE_ME" >&2
+""",
+    "deploy-frontend": """\
+#!/usr/bin/env bash
+# Install/serve the built artifact on a device or host.
+# Args: $1 = target, $2 = blob json, $3 = device/serial (optional).
+set -euo pipefail
+target="$1"; blob="$2"; device="${3:-}"
+echo "deploy $target to ${device:-host}" >&2
+""",
+    "health": """\
+#!/usr/bin/env bash
+# Exit 0 when the backend in the blob is ready, non-zero otherwise.
+set -euo pipefail
+blob="${1:-$CORRAL_BLOB}"
+# url=$(jq -r .backend_url <<<"$blob"); curl -fsS "$url/health"
+""",
+    "teardown-extra": """\
+#!/usr/bin/env bash
+# Any cleanup the box-destroy doesn't cover (e.g. tailscale logout, dns).
+# corral destroys the box itself after this runs.
+set -euo pipefail
+blob="${1:-$CORRAL_BLOB}"
+""",
+}
+
+
+def do_init():
+    config_path = Path("corral.toml")
+    if config_path.exists():
+        print("corral.toml already exists — leaving it", file=sys.stderr)
+    else:
+        config_path.write_text(SCAFFOLD_CONFIG)
+        print("wrote corral.toml")
+    hooks = Path("hooks")
+    hooks.mkdir(exist_ok=True)
+    for name, body in SCAFFOLD_HOOKS.items():
+        path = hooks / name
+        if path.exists():
+            continue
+        path.write_text(body)
+        path.chmod(0o755)
+        print(f"wrote hooks/{name}")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="corral", description="ephemeral box broker + resource queue")
+    parser.add_argument("-c", "--config", default="corral.toml")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("init", help="scaffold corral.toml + hooks/ into the current dir")
+    allocate = sub.add_parser("allocate", help="get a box for KEY (clones on demand)")
+    allocate.add_argument("key")
+    allocate.add_argument("--kind", choices=["shared", "clone"], default="clone")
+    release = sub.add_parser("release", help="tear down the box for KEY")
+    release.add_argument("key")
+    sub.add_parser("list", help="show the pool")
+    reap = sub.add_parser("reap", help="destroy clones older than --ttl minutes")
+    reap.add_argument("--ttl", type=int, default=120)
+    resource = sub.add_parser("resource", help="run a command holding a named lock")
+    resource.add_argument("name")
+    resource.add_argument("cmd", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+
+    if args.cmd == "init":
+        return do_init()
+
+    config = load_config(args.config)
+    sd = state_dir(config)
+    provider = make_provider(config, sd)
+    handlers = {
+        "allocate": cmd_allocate,
+        "release": cmd_release,
+        "list": cmd_list,
+        "reap": cmd_reap,
+        "resource": cmd_resource,
+    }
+    return handlers[args.cmd](config, provider, sd, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

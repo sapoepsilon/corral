@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+blob="${1:-$CORRAL_BLOB}"
+echo "[mock] setup-backend for box $(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["box_id"])' "$blob")" >&2
+echo '{"backend_url":"http://10.0.0.1:3001","ip":"10.0.0.1"}'
