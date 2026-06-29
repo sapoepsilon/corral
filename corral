@@ -120,7 +120,20 @@ class ProxmoxProvider:
         if self.snapshot:
             command += ["--snapname", self.snapshot]
         self._ssh(*command)
+        if self.kind == "lxc":
+            self._reset_macs(new_id)
         self._ssh(self.verb, "start", str(new_id))
+
+    def _reset_macs(self, box_id):
+        # pct clone keeps the source's MAC — two boxes on one bridge with the same
+        # MAC breaks networking for both. Strip hwaddr so Proxmox assigns a new one.
+        config = self._ssh(self.verb, "config", str(box_id))
+        for line in config.splitlines():
+            if not line.startswith("net") or "hwaddr=" not in line:
+                continue
+            key, value = line.split(":", 1)
+            kept = ",".join(token for token in value.strip().split(",") if not token.startswith("hwaddr="))
+            self._ssh(self.verb, "set", str(box_id), f"--{key.strip()}", kept)
 
     def destroy(self, box_id):
         # stop may fail if already stopped — that's fine, destroy is the goal.
