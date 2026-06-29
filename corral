@@ -92,6 +92,9 @@ class ProxmoxProvider:
         self.kind = provider.get("kind", "lxc")
         self.verb = "pct" if self.kind == "lxc" else "qm"
         self.name_flag = "--hostname" if self.kind == "lxc" else "--name"
+        # Clone from a snapshot so an always-on baseline can be the template
+        # without being stopped — point-in-time, read-only w.r.t. the live box.
+        self.snapshot = provider.get("snapshot")
 
     def _ssh(self, *command):
         result = subprocess.run(
@@ -113,7 +116,10 @@ class ProxmoxProvider:
         return boxes
 
     def clone(self, new_id, name):
-        self._ssh(self.verb, "clone", str(self.template), str(new_id), self.name_flag, name, "--full", "0")
+        command = [self.verb, "clone", str(self.template), str(new_id), self.name_flag, name, "--full", "0"]
+        if self.snapshot:
+            command += ["--snapname", self.snapshot]
+        self._ssh(*command)
         self._ssh(self.verb, "start", str(new_id))
 
     def destroy(self, box_id):
