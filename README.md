@@ -62,6 +62,7 @@ idempotent re-allocate, release-frees-a-slot.
 ## Adapters
 
 `hooks/` for one project is an *adapter*. The reference adapter lives in
-[`adapters/mock/`](adapters/mock/). Real example: the Kentra Health adapter
-(Proxmox linked-clone + Supabase + Tailscale + Flutter/adb) in the private
-kentra-monorepo under `corral/`.
+[`adapters/mock/`](adapters/mock/). A real adapter is small — e.g. a mobile app on a
+Proxmox linked-clone backend reachable over Tailscale: `setup-backend` clones the box
+and deploys the branch, `build-frontend`/`deploy-frontend` build the app and push it to
+an emulator or device, kept in the project's own private repo.
