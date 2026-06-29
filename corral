@@ -136,8 +136,17 @@ class ProxmoxProvider:
             self._ssh(self.verb, "set", str(box_id), f"--{key.strip()}", kept)
 
     def destroy(self, box_id):
-        # stop may fail if already stopped — that's fine, destroy is the goal.
+        # stop may fail if already stopped — that's fine. But destroy fails on a
+        # still-running box, and stop returns before the box is actually down, so
+        # wait for "stopped" before destroying.
         subprocess.run(["ssh", self.ssh, self.verb, "stop", str(box_id)], capture_output=True, text=True)
+        for _ in range(20):
+            status = subprocess.run(
+                ["ssh", self.ssh, self.verb, "status", str(box_id)], capture_output=True, text=True
+            ).stdout
+            if "stopped" in status:
+                break
+            time.sleep(1)
         self._ssh(self.verb, "destroy", str(box_id))
 
 
