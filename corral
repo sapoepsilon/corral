@@ -56,6 +56,7 @@ class MockProvider:
     cap / queue / release lifecycle be exercised with zero infrastructure."""
 
     def __init__(self, config, sd):
+        self.sd = sd
         self.store = sd / "mock-boxes.json"
 
     def _read(self):
@@ -74,10 +75,14 @@ class MockProvider:
         data[str(new_id)] = name
         self._write(data)
 
+    def start(self, box_id):
+        (self.sd / f"mock-started-{box_id}").touch()
+
     def destroy(self, box_id):
         data = self._read()
         data.pop(str(box_id), None)
         self._write(data)
+        (self.sd / f"mock-started-{box_id}").unlink(missing_ok=True)
 
 
 class ProxmoxProvider:
@@ -122,7 +127,9 @@ class ProxmoxProvider:
         self._ssh(*command)
         if self.kind == "lxc":
             self._reset_macs(new_id)
-        self._ssh(self.verb, "start", str(new_id))
+
+    def start(self, box_id):
+        self._ssh(self.verb, "start", str(box_id))
 
     def _reset_macs(self, box_id):
         # pct clone keeps the source's MAC — two boxes on one bridge with the same
@@ -228,6 +235,10 @@ def cmd_allocate(config, provider, sd, args):
         created = int(time.time())
         (sd / "clones" / f"{name}.json").write_text(json.dumps({"created": created, "key": args.key, "id": new_id}))
         blob = base_blob(config, kind="clone", key=args.key, box_id=new_id, name=name, created=created)
+        # The clone is a byte copy of the template — identity-bearing state (VPN node
+        # keys, machine ids) must be scrubbed before its services ever run.
+        blob.update(run_hook(config, "pre-start", blob))
+        provider.start(new_id)
         blob.update(run_hook(config, "setup-backend", blob))
         print(json.dumps(blob))
         return 0
@@ -361,7 +372,7 @@ blob="${1:-$CORRAL_BLOB}"
 """,
     "teardown-extra": """\
 #!/usr/bin/env bash
-# Any cleanup the box-destroy doesn't cover (e.g. tailscale logout, dns).
+# Any cleanup the box-destroy doesn't cover (e.g. dns records).
 # corral destroys the box itself after this runs.
 set -euo pipefail
 blob="${1:-$CORRAL_BLOB}"

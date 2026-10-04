@@ -30,14 +30,15 @@ the project needs — typically `backend_url` and `ip`.
 
 | Hook | When | Args | Should do |
 |---|---|---|---|
+| `pre-start` | after a box is cloned, **before its first boot** (clones only) | blob | scrub identity the clone copied from the template — e.g. wipe `/var/lib/tailscale` and disable `tailscaled` via `pct mount`, so the clone never comes up as the template's node |
 | `setup-backend` | after a box is cloned/started, or on a shared allocate | blob | make the box reachable (e.g. `tailscale up`), install/start the backend, **echo `{"backend_url":...,"ip":...}`** |
 | `build-frontend` | called by your pipeline, not the engine | `<target> <blob>` | build for `web` / `ios-sim` / `ios-device` / `macos` / `android-emu` / `android-device` |
 | `deploy-frontend` | called by your pipeline | `<target> <blob> [device]` | serve the URL / install to a sim / push to a device |
 | `health` | your pipeline polls it | blob | exit 0 when the backend is ready |
-| `teardown-extra` | before corral destroys the box | blob | cleanup the destroy won't cover (tailscale logout, dns) |
+| `teardown-extra` | before corral destroys the box | blob | cleanup the destroy won't cover (dns records, external registrations). Never `tailscale logout` a box whose state may still be the template's copy — that logs the template out |
 
 `build-frontend` / `deploy-frontend` / `health` are called by *your* pipeline, not
-by corral itself — corral only invokes `setup-backend` (on allocate) and
+by corral itself — corral only invokes `pre-start` + `setup-backend` (on allocate) and
 `teardown-extra` (on release/reap). They live here so a project keeps all its
 target-specific glue in one place.
 
