@@ -36,6 +36,13 @@ SETUP_HOOK = """\
 echo '{"backend_url":"http://mock"}'
 """
 
+PRE_START_HOOK = """\
+#!/usr/bin/env bash
+box=$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["box_id"])' "$1")
+[ ! -e "{state}/mock-started-$box" ] || {{ echo "box $box already started" >&2; exit 1; }}
+echo '{{"scrubbed":true}}'
+"""
+
 
 class CorralCli(unittest.TestCase):
     def setUp(self):
@@ -46,6 +53,9 @@ class CorralCli(unittest.TestCase):
         setup = hooks / "setup-backend"
         setup.write_text(SETUP_HOOK)
         setup.chmod(0o755)
+        pre_start = hooks / "pre-start"
+        pre_start.write_text(PRE_START_HOOK.format(state=state))
+        pre_start.chmod(0o755)
         self.config = Path(self.tmp) / "corral.toml"
         self.config.write_text(CONFIG.format(state=state, hooks=hooks))
 
@@ -60,6 +70,9 @@ class CorralCli(unittest.TestCase):
         first = self.run_corral("allocate", "a")
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(json.loads(first.stdout)["backend_url"], "http://mock")
+        # pre-start ran on the stopped clone, then the box was started
+        self.assertTrue(json.loads(first.stdout)["scrubbed"])
+        self.assertTrue((Path(self.tmp) / "state" / f"mock-started-{json.loads(first.stdout)['box_id']}").exists())
         self.assertEqual(self.run_corral("allocate", "b").returncode, 0)
 
         # at cap -> wait signal (EX_TEMPFAIL)
